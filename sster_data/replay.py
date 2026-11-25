@@ -1,13 +1,58 @@
 """Regenerate an example using its versioned, private event and stream record."""
 import json
+from functools import lru_cache
 from pathlib import Path
 import tarfile
 
 import numpy as np
 
 from .episodes import realize,require_frozen_seasons
-from .planning import Episode
-from .storage import atomic, pack, unpack
+from .ancestry import Roster, check_plan, resolve, sidecar, validate_world
+from .planning import Episode, dimensions, encode
+from .scm import FAMILIES, reserved_ancestors
+from .storage import atomic, digest, pack, read_json, unpack
+
+
+@lru_cache(maxsize=16)
+def replay_roster(path,split,n,smoke,plan_sha256,ledger_sha256,changed):
+    """Cache only admitted IDs; never retain an open plan handle on Windows."""
+    count = dimensions(split,smoke)[0]
+    if changed:
+        roster = resolve(split,n,FAMILIES,count)
+    else:
+        roster = {f:Roster(reserved_ancestors(split,n,f,count),(),()) for f in FAMILIES}
+    check_plan(path,split,n,smoke,roster)
+    return {f:r.ids for f,r in roster.items()}
+
+
+def verify_ancestor(root,ep):
+    count, episodes, _ = dimensions(ep.split,ep.smoke)
+    path = root/"build"/f"plan-{ep.n}.npy"
+    binding = sidecar(path)
+    marker = root/"_SUCCESS"
+    expected = None
+    ledger_hash = digest(binding) if binding.exists() else None
+    if marker.exists():
+        if digest(root/"audit.json") != read_json(marker)["audit_sha256"]:
+            raise IOError("replay audit disagrees with release marker")
+        expected = read_json(root/"audit.json").get("ancestor_replacement_sha256",{}).get(str(ep.n))
+        if expected and ledger_hash != expected:
+            raise ValueError("published ancestor replacement ledger missing or altered")
+    if binding.exists() or marker.exists():
+        changed = binding.exists() and any(r["replaced"] or r["rejected"] for r in read_json(binding)["families"].values())
+        if marker.exists() and bool(expected) != changed:
+            raise ValueError("replay ancestor map differs from published binding")
+        roster = replay_roster(path,ep.split,ep.n,ep.smoke,digest(path),ledger_hash,changed)
+        ids = roster[ep.family]
+        if ep.ancestor not in ids or not 0 <= ep.episode < episodes:
+            raise ValueError("replay record belongs to no frozen ancestor or episode slot")
+        index = (FAMILIES.index(ep.family)*count+ids.index(ep.ancestor))*episodes+ep.episode
+        p = np.load(path,mmap_mode="r",allow_pickle=False)
+        if Episode(ep.split,ep.n,*encode(*p[index]),smoke=ep.smoke) != ep:
+            raise ValueError("replay ticket disagrees with frozen plan")
+    elif ep.ancestor not in reserved_ancestors(ep.split,ep.n,ep.family,count):
+        raise ValueError("unbound replay ancestor outside the reserved roster")
+    validate_world(ep.split,ep.n,ep.family,ep.ancestor)
 
 
 def replay(root,shard,uid,save=None):
@@ -20,6 +65,7 @@ def replay(root,shard,uid,save=None):
                  meta["mode"],tuple(meta["focal"]) if meta["focal"] else None,meta["smoke"])
     if ep.id != uid:
         raise ValueError("replay identifier mismatch")
+    verify_ancestor(root,ep)
     inputs,targets,_,traces = realize(ep,meta["scale"],meta["retry"],audit=True)
     order = np.argsort(meta["physical_to_exported"])
     with tarfile.open(root/"shards"/tag,"r:") as tar:

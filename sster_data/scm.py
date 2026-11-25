@@ -30,16 +30,29 @@ def bucket(n, family, candidate):
     return int.from_bytes(hashlib.sha256(text.encode()).digest(), "big") % 100
 
 
+BUCKETS = {"train": (0, 80), "validation": (80, 90), "test": (90, 100)}
+
+
 @lru_cache(maxsize=128)
-def ancestors(split, n, family, count):
-    low, high = {"train": (0, 80), "validation": (80, 90), "test": (90, 100)}[split]
+def reserved_ancestors(split, n, family, count):
+    low, high = BUCKETS[split]
     ids = []
     i = 0
     while len(ids) < count:
         if low <= bucket(n, family, i) < high:
             ids.append(i)
         i += 1
-    return ids
+    return tuple(ids)
+
+
+def ancestors(split, n, family, count):
+    """Effective IDs in reserved-slot order, including any deterministic replacements."""
+    from .ancestry import resolve
+    return list(resolve(split,n,(family,),count)[family].ids)
+
+
+class InvalidAncestor(Exception):
+    """The deterministic SCM draw violates a structural invariant before any episode."""
 
 
 @dataclass
@@ -124,7 +137,11 @@ def world(split, n, family, ancestor):
         interaction[i] *= factor
         beta[i] *= factor
         budgets[i] = b * factor
-    assert (budgets.sum(axis=1) <= rho + 1e-12).all()
+    if not np.all(np.isfinite(rho) & (rho >= .1) & (rho <= .85)):
+        raise InvalidAncestor("row-contraction-rate")
+    row_budget = budgets.sum(axis=1)
+    if not np.all(np.isfinite(row_budget) & (row_budget <= rho + 1e-12)):
+        raise InvalidAncestor("row-contraction-budget")
     warm = max(64, lag * math.ceil(math.log(1e-6) / math.log(max(rho))))
     args = (count, parents, delays, typ, coeff, params, pair, interaction, units,
             weights, bias, beta, np.tanh(bias), saturation, cut, budgets)

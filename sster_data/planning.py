@@ -9,7 +9,9 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import maximum_flow
 
-from .scm import FAMILIES, WIDTHS, PROFILE, ancestors, rng_for, stream
+from .ancestry import check_plan, ledger, resolve, sidecar
+from .scm import FAMILIES, WIDTHS, PROFILE, rng_for, stream
+from .storage import digest, read_json, write_json
 
 MODES = ("healthy", "process", "observation", "mixed")
 LOCAL = tuple(f"L{i:02}" for i in range(1, 21))
@@ -156,15 +158,17 @@ def cover(records, ids, split, n, mode, reps):
             records["severity"][idx] = num % 3
 
 
-def plan(path, split, n, smoke):
-    if path.exists():
-        return np.load(path, mmap_mode="r", allow_pickle=False)
+def plan(path, split, n, smoke, rosters=None):
     a, episodes, reps = dimensions(split, smoke)
+    if rosters is None:
+        rosters = resolve(split,n,FAMILIES,a)
+    if path.exists():
+        return check_plan(path,split,n,smoke,rosters)
     records = np.zeros(4*a*episodes, dtype=PLAN_TYPE)
     records["layer"] = records["kind"] = records["severity"] = -1
     i = 0
     for family_id, family in enumerate(FAMILIES):
-        for candidate in ancestors(split, n, family, a):
+        for candidate in rosters[family].ids:
             ix = slice(i, i+episodes)
             records["family"][ix] = family_id
             records["ancestor"][ix] = candidate
@@ -181,7 +185,15 @@ def plan(path, split, n, smoke):
             cover(records, ids, split, n, mode, reps)
         offset += count
     assert offset == len(records)
-    with open(path.with_suffix(".tmp"), "wb") as out:
+    temp = path.with_suffix(f".{os.getpid()}.tmp")
+    with open(temp, "wb") as out:
         np.save(out, records)
-    os.replace(path.with_suffix(".tmp"), path)
-    return np.load(path, mmap_mode="r", allow_pickle=False)
+        out.flush()
+        os.fsync(out.fileno())
+    expected = ledger(split,n,smoke,rosters,digest(temp))
+    binding = sidecar(path)
+    if binding.exists() and read_json(binding) != expected:
+        raise ValueError(f"orphaned ancestor replacement ledger disagrees with regenerated plan: {binding}")
+    write_json(binding,expected)
+    os.replace(temp,path)
+    return check_plan(path,split,n,smoke,rosters)

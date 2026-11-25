@@ -1,5 +1,7 @@
 import argparse
+from contextlib import nullcontext
 import json
+import multiprocessing
 from pathlib import Path
 
 from .corpus import WorkerDeviceError, finalize, generate
@@ -39,6 +41,7 @@ def main():
         p.add_argument("--worker-devices",type=parse_devices,metavar="I,J,...",
                        help="Assign GP workers cyclically to local CUDA indices; repeat an index for more workers.")
     check.add_argument("--deep",action="store_true",help="Also decode every indexed public member using random-access offsets.")
+    check.add_argument("--workers",type=int,default=1,help="CPU processes for deterministic structural ancestor checks.")
     args = parser.parse_args()
     if args.cmd == "diagnose":
         from .diagnostics import diagnose
@@ -49,14 +52,15 @@ def main():
     if args.cmd == "replay":
         print(replay(args.out/args.split,args.shard,args.id,args.save))
         return
-    if args.cmd in ("generate","smoke") and args.workers < 1:
+    if args.cmd in ("generate","smoke","verify") and args.workers < 1:
         parser.error("--workers must be positive")
     for split in (["train","validation","test"] if args.split=="all" else [args.split]):
         if args.cmd == "verify":
             root = args.out/split
-            with lock(root/"build.lock"):
+            with lock(root/"build.lock"), (multiprocessing.get_context("spawn").Pool(args.workers)
+                                           if args.workers > 1 else nullcontext()) as workers:
                 marker = read_json(root/"_SUCCESS")
-                report = finalize(root,split,marker["smoke"],deep=args.deep)
+                report = finalize(root,split,marker["smoke"],deep=args.deep,pool=workers)
                 print(f"{split}: {report['windows']} windows, manifest SHA-256 {report['manifest_sha256']}")
         else:
             try:

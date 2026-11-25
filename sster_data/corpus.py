@@ -11,11 +11,12 @@ import tarfile
 
 import numpy as np
 
+from .ancestry import check_plan, resolve, sidecar as ancestry_sidecar
 from .balance import balanced_orders
 from .calibration import calibration
 from .episodes import NumericalFailure, realize, require_frozen_seasons
 from .planning import dimensions, encode as decode_record, Episode, MODES, plan, quotas, templates, widths
-from .scm import FAMILIES, PROFILE, ancestors, bucket, rng_for
+from .scm import FAMILIES, PROFILE, rng_for
 from .storage import Archive, atomic, digest, encode, lock, pack, read_json, unpack, write_json
 
 BATCH = 64
@@ -44,18 +45,32 @@ def read_member(tar, name):
 def stage(job):
     root,split,smoke,n,begin,end,scales = job
     tag,plan_path,stage_path,roles_path,receipt = paths(root,n,begin)
+    p = read_plan(str(plan_path))
     if receipt.exists():
         if not roles_path.exists():
             raise IOError("committed shard missing its exposure receipt")
-        for row in read_json(receipt)["rows"]:
+        rows = read_json(receipt)["rows"]
+        if len(rows) != end-begin:
+            raise ValueError(f"short committed shard {tag}")
+        for serial,row in enumerate(rows,begin):
+            ep = Episode(split,n,*decode_record(*p[serial]),smoke=smoke)
+            if (row["id"],row["K"],row["mode"],row["focal"]) != (ep.id,ep.k,ep.mode,list(ep.focus) if ep.focus else None):
+                raise ValueError(f"committed shard disagrees with frozen plan {tag}")
             require_frozen_seasons(row,row["rejections"])
         return
     if roles_path.exists() and stage_path.exists():
         roles = read_json(roles_path)
-        if digest(stage_path) == roles["sha256"]:
-            return
-        raise IOError(f"damaged physical staging archive {tag}")
-    p = read_plan(str(plan_path))
+        if digest(stage_path) != roles["sha256"]:
+            raise IOError(f"damaged physical staging archive {tag}")
+        tickets = [Episode(split,n,*decode_record(*p[j]),smoke=smoke) for j in range(begin,end)]
+        if [r[0] for r in roles["roles"]] != [ep.id for ep in tickets]:
+            raise ValueError(f"staged ancestor/episode IDs disagree with frozen plan {tag}")
+        with tarfile.open(stage_path,"r:") as archive:
+            for ep in tickets:
+                meta = json.loads(read_member(archive,ep.id+".json"))
+                if (meta["K"],meta["mode"],meta["focal"]) != (ep.k,ep.mode,list(ep.focus) if ep.focus else None):
+                    raise ValueError(f"staged ticket disagrees with frozen plan {tag}")
+        return
     roles = []
     with Archive(stage_path) as archive:
         for serial in range(begin,end):
@@ -208,7 +223,13 @@ def prepare_orders(root,n,p,starts):
     os.replace(tmp,path)
 
 
-def finalize(root, split, smoke, deep=False):
+def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
+    existing = None
+    if (root/"_SUCCESS").exists():
+        marker = read_json(root/"_SUCCESS")
+        if marker["audit_sha256"] != digest(root/"audit.json") or marker["manifest_sha256"] != digest(root/"manifest.jsonl"):
+            raise IOError("published marker does not match audit or manifest")
+        existing = read_json(root/"audit.json")
     expected = quotas(split,smoke)
     counts, focuses, witnessed, appearance = Counter(),Counter(),Counter(),Counter()
     all_events, seen_events = Counter(),Counter()
@@ -221,9 +242,14 @@ def finalize(root, split, smoke, deep=False):
     tmp = root/"manifest.partial"
     total = 0
     shard_hash = hashlib.sha256()
+    repairs = {}
     with open(tmp,"wb") as out:
         for n in widths(smoke):
-            p = read_plan(str(root/"build"/f"plan-{n}.npy"))
+            path = root/"build"/f"plan-{n}.npy"
+            roster = resolve(split,n,FAMILIES,ancestor_count,pool) if roster_by_width is None else roster_by_width[n]
+            p = check_plan(path,split,n,smoke,roster)
+            if any(r.replaced for r in roster.values()):
+                repairs[str(n)] = digest(ancestry_sidecar(path))
             for begin in range(0,len(p),BATCH):
                 receipt = read_json(paths(root,n,begin)[-1])
                 for kind in ("public","private"):
@@ -238,11 +264,11 @@ def finalize(root, split, smoke, deep=False):
                     require_frozen_seasons(row,row["rejections"])
                     ep = Episode(split,n,*decode_record(*p[j]),smoke=smoke)
                     family = FAMILIES[j//(ancestor_count*episode_count)]
-                    candidate = ancestors(split,n,family,ancestor_count)[j//episode_count%ancestor_count]
+                    candidate = roster[family].ids[j//episode_count%ancestor_count]
                     if (ep.family,ep.ancestor,ep.episode) != (family,candidate,j%episode_count):
                         raise ValueError("ancestor/episode multiplicity or split membership failed")
-                    if row["id"] != ep.id or (row["K"],row["mode"],row["ancestor"],row["episode"],row["family"]) != (
-                            ep.k,ep.mode,ep.ancestor,ep.episode,ep.family):
+                    if row["id"] != ep.id or (row["K"],row["mode"],row["ancestor"],row["episode"],row["family"],row["focal"]) != (
+                            ep.k,ep.mode,ep.ancestor,ep.episode,ep.family,list(ep.focus) if ep.focus else None):
                         raise ValueError("receipt row disagrees with ancestor quota")
                     cell = (n,ep.k,ep.mode)
                     counts[cell] += 1
@@ -302,8 +328,14 @@ def finalize(root, split, smoke, deep=False):
                   archive_list_sha256=shard_hash.hexdigest(),calibration_sha256=digest(root.parent/"calibration.json"))
     if rejects:
         report["numerical_retry_seasons"] = "initial-background"
+    if repairs:
+        report["ancestor_replacement_sha256"] = repairs
+    if existing is not None and repairs != existing.get("ancestor_replacement_sha256",{}):
+        raise ValueError("published ancestor replacement binding differs from verified plans")
+    report["manifest_sha256"] = digest(tmp)
+    if existing is not None and hashlib.sha256(encode(report)+b"\n").hexdigest() != marker["audit_sha256"]:
+        raise ValueError("reconstructed audit or manifest differs from the published release")
     os.replace(tmp,root/"manifest.jsonl")
-    report["manifest_sha256"] = digest(root/"manifest.jsonl")
     if deep:
         deep_check(root)
     write_json(root/"audit.json",report)
@@ -380,6 +412,8 @@ def generate(out, split, workers, smoke=False, worker_devices=None):
     for sub in ("build","receipts","shards","private"):
         (root/sub).mkdir(parents=True,exist_ok=True)
     with lock(root/"build.lock"):
+        ctx = multiprocessing.get_context("spawn")
+        ancestor_count = dimensions(split,smoke)[0]
         success = root/"_SUCCESS"
         if success.exists():
             doc = read_json(success)
@@ -388,19 +422,31 @@ def generate(out, split, workers, smoke=False, worker_devices=None):
             previous = read_json(root/"audit.json")
             if previous["numerical_rejections"] and previous.get("numerical_retry_seasons") != "initial-background":
                 raise ValueError("existing release contains legacy numerical retries; audit and rebuild affected shards")
+            repairs = {}
+            with ctx.Pool(workers) as validation_pool:
+                for n in widths(smoke):
+                    path = root/"build"/f"plan-{n}.npy"
+                    roster = resolve(split,n,FAMILIES,ancestor_count,validation_pool)
+                    check_plan(path,split,n,smoke,roster)
+                    if any(r.replaced for r in roster.values()):
+                        repairs[str(n)] = digest(ancestry_sidecar(path))
+            if repairs != previous.get("ancestor_replacement_sha256",{}):
+                raise ValueError("published ancestor replacement binding differs from verified plans")
             print(f"{split} already published {doc['windows']} windows",flush=True)
             return
         os.environ["OMP_NUM_THREADS"] = os.environ["OPENBLAS_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = "1"
-        ctx = multiprocessing.get_context("spawn")
         # A fresh counter per pool makes sequential and separately launched splits start at slot zero.
         initargs = () if worker_devices is None else (worker_devices,ctx.Value("q",0))
         with ctx.Pool(workers,initializer=configure_worker,initargs=initargs) as pool:
             print(f"{split}: fitting/checking independent scale bank",flush=True)
             bank = calibration(out,smoke,pool)
+            roster_by_width = {}
             for n in widths(smoke):
                 _,p_path,*_ = paths(root,n,0)
                 print(f"{split} N={n}: matching frozen backgrounds and template quotas",flush=True)
-                p = plan(p_path,split,n,smoke)
+                roster = resolve(split,n,FAMILIES,ancestor_count,pool)
+                roster_by_width[n] = roster
+                p = plan(p_path,split,n,smoke,roster)
                 starts = range(0,len(p),BATCH)
                 jobs = ((root,split,smoke,n,b,min(b+BATCH,len(p)),bank["scales"]) for b in starts)
                 for i,_ in enumerate(pool.imap_unordered(stage,jobs,chunksize=1),1):
@@ -410,5 +456,5 @@ def generate(out, split, workers, smoke=False, worker_devices=None):
                 prepare_orders(root,n,p,starts)
                 for _ in pool.imap_unordered(publish_batch,((root,n,b) for b in starts),chunksize=1):
                     pass
-            report = finalize(root,split,smoke)
+            report = finalize(root,split,smoke,roster_by_width=roster_by_width)
             print(f"{split}: verified and published {report['windows']} windows",flush=True)
