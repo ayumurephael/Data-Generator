@@ -53,7 +53,7 @@ def schedule(ep, bg, w, crop, lag, scale):
     if ep.focus and ep.focus[1].startswith("S"):
         possible = [j for j in possible if ep.focus[1] in bg.eligible(int(j), crop+64, crop+w-64)]
         if not len(possible):
-            raise RuntimeError("focal assignment is incompatible with the frozen background")
+            raise RuntimeError(f"focal assignment {ep.focus} is incompatible with the frozen background of {ep.id}")
     first = int(r.choice(possible))
     sites = [first, *map(int, r.choice(np.delete(np.arange(ep.n), first), k-1, replace=False))]
     repeat = r.random(k) < .5
@@ -211,7 +211,11 @@ def healthy_path(wld, bg):
 def realize(ep, scale, retry=0, audit=False):
     wld = world(ep.split, ep.n, ep.family, ep.ancestor)
     w, ordinary, crop = ep.clock(wld.lag)
-    bg = catalog.normal_background(ep.rng("background", retry), ep.n, wld.warm, ordinary)
+    frozen = catalog.normal_seasons(ep.rng("background"),ep.n,wld.warm,ordinary) if retry else None
+    def background(extra=0):
+        return catalog.normal_background(ep.rng("background",retry),ep.n,wld.warm,ordinary,
+                                         extra=extra,frozen_seasons=frozen)
+    bg = background()
     events, pattern = schedule(ep, bg, w, crop, wld.lag, scale)
     extra = 0
     censored = False
@@ -261,13 +265,15 @@ def realize(ep, scale, retry=0, audit=False):
         bound = 0 if tail <= margin else (wld.lag if rho == 0. else
             wld.lag*math.ceil(math.log(tail/margin)/-math.log(rho)))
         extra = min(65536, extra+max(3, last+3-t, bound+3))
-        bg = catalog.normal_background(ep.rng("background", retry), ep.n, wld.warm, ordinary, extra=extra)
+        bg = background(extra)
     h, active = hysteresis(delta.max(axis=1)/scale)
     y = h | direct.any(axis=1)
     inputs, targets, private = observe(ep,w,ordinary,crop,x0,reading,delta,direct,scale,y,events)
     after = max((e.stop for e in events),default=len(h))
     onset = np.flatnonzero(h & ~np.r_[False,h[:-1]])
     private["new_propagation_onset_after_last_event"] = bool((onset >= after).any())
+    if retry:
+        private["season_retry"] = 0
     assert int(targets["R"].sum()) == ep.k and np.all(np.diff(inputs["time"]) > 0)
     private.update(id=ep.id, N=ep.n, family=ep.family, ancestor=ep.ancestor, episode=ep.episode,
                    K=ep.k, mode=ep.mode, split=ep.split, focal=list(ep.focus) if ep.focus else None,
@@ -278,3 +284,9 @@ def realize(ep, scale, retry=0, audit=False):
     traces = (dict(normal=x0, factual=xj, reading=reading, delta=delta, upper=upper,
                    direct=direct, y=y) if audit else None)
     return inputs, targets, private, traces
+
+
+def require_frozen_seasons(record,retries):
+    """Pre-fix first attempts are equivalent. Retried archives require explicit provenance."""
+    if retries and record.get("season_retry") != 0:
+        raise ValueError(f"legacy numerical retry in {record['id']}: rebuild its shard and revalidate width exposure")

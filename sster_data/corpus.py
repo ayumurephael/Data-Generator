@@ -13,7 +13,7 @@ import numpy as np
 
 from .balance import balanced_orders
 from .calibration import calibration
-from .episodes import NumericalFailure, realize
+from .episodes import NumericalFailure, realize, require_frozen_seasons
 from .planning import dimensions, encode as decode_record, Episode, MODES, plan, quotas, templates, widths
 from .scm import FAMILIES, PROFILE, ancestors, bucket, rng_for
 from .storage import Archive, atomic, digest, encode, lock, pack, read_json, unpack, write_json
@@ -47,6 +47,8 @@ def stage(job):
     if receipt.exists():
         if not roles_path.exists():
             raise IOError("committed shard missing its exposure receipt")
+        for row in read_json(receipt)["rows"]:
+            require_frozen_seasons(row,row["rejections"])
         return
     if roles_path.exists() and stage_path.exists():
         roles = read_json(roles_path)
@@ -146,6 +148,7 @@ def publish_batch(job):
             inverse = np.argsort(order)
             data = unpack(read_member(old,uid+".npz"))
             meta = json.loads(read_member(old,uid+".json"))
+            require_frozen_seasons(meta,meta["retry"])
             meta["physical_to_exported"] = inverse.tolist()
             meta["scale_reference"] = "../calibration.json"
             for ev in meta["events"]:
@@ -176,6 +179,8 @@ def publish_batch(job):
             anchor_rows = positives if len(positives) else inp["time"]
             row["anchor"] = int(anchor_rows[len(anchor_rows)//2])
             row["focal_witness"] = bool(meta["focal"] and meta["event_witness"][0])
+            if meta["retry"]:
+                row["season_retry"] = meta["season_retry"]
             rows.append(row)
     # 64 rows * maximum public tuple < 90 MiB even before compression.
     # The byte check also guards against future changes in the maximum shape.
@@ -230,6 +235,7 @@ def finalize(root, split, smoke, deep=False):
                 if len(receipt["rows"]) != min(BATCH,len(p)-begin):
                     raise ValueError("short shard")
                 for j,row in enumerate(receipt["rows"],begin):
+                    require_frozen_seasons(row,row["rejections"])
                     ep = Episode(split,n,*decode_record(*p[j]),smoke=smoke)
                     family = FAMILIES[j//(ancestor_count*episode_count)]
                     candidate = ancestors(split,n,family,ancestor_count)[j//episode_count%ancestor_count]
@@ -258,7 +264,7 @@ def finalize(root, split, smoke, deep=False):
                     acquisitions[cell+(row["acquisition"],)] += 1
                     repeated[cell+(len(row["events"])-ep.k,)] += 1
                     rejects += row["rejections"]
-                    private_keys = {"raw","known","events","focal_witness","layout","acquisition","quality","rejections"}
+                    private_keys = {"raw","known","events","focal_witness","layout","acquisition","quality","rejections","season_retry"}
                     out.write(encode({k:v for k,v in row.items() if k not in private_keys})+b"\n")
                     uid_table[total] = bytes.fromhex(row["id"])
                     total += 1
@@ -294,6 +300,8 @@ def finalize(root, split, smoke, deep=False):
                   quality_flags=records(quality),layout_counts=records(layouts),acquisition_counts=records(acquisitions),
                   repeated_source_counts=records(repeated),event_severity_counts=records(severity),numerical_rejections=rejects,
                   archive_list_sha256=shard_hash.hexdigest(),calibration_sha256=digest(root.parent/"calibration.json"))
+    if rejects:
+        report["numerical_retry_seasons"] = "initial-background"
     os.replace(tmp,root/"manifest.jsonl")
     report["manifest_sha256"] = digest(root/"manifest.jsonl")
     if deep:
@@ -349,6 +357,9 @@ def generate(out, split, workers, smoke=False):
             doc = read_json(success)
             if doc["smoke"] != smoke or doc["manifest_sha256"] != digest(root/"manifest.jsonl") or doc["audit_sha256"] != digest(root/"audit.json"):
                 raise IOError("existing release does not match requested profile or checksums")
+            previous = read_json(root/"audit.json")
+            if previous["numerical_rejections"] and previous.get("numerical_retry_seasons") != "initial-background":
+                raise ValueError("existing release contains legacy numerical retries; audit and rebuild affected shards")
             print(f"{split} already published {doc['windows']} windows",flush=True)
             return
         os.environ["OMP_NUM_THREADS"] = os.environ["OPENBLAS_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = "1"

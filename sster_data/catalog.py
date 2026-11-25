@@ -335,11 +335,16 @@ class Background:
         return drive(s)-drive(self.seasonal[ix,i])
 
 
-def normal_background(rng,N,Wwarm,Tstar,offset=0,extra=0):
+def normal_background(rng,N,Wwarm,Tstar,offset=0,extra=0,*,frozen_seasons=None):
     if offset!=0: raise ValueError("record clock must begin at ordinary tick zero")
     t=np.arange(-Wwarm,Tstar+extra)
     sr,gr,cr,tr,nr=streams(rng,5)
-    components=[season_params(r,Tstar) for r in streams(sr,N)]
+    # A numerical retry retains all originally matched normal seasonal parameters,
+    # including wavelet supports and AM metadata, at every physical node.
+    components=([season_params(r,Tstar) for r in streams(sr,N)]
+                if frozen_seasons is None else frozen_seasons.components)
+    if len(components)!=N:
+        raise ValueError("frozen seasonal metadata has a different channel count")
     seasonal=np.stack([render(spec,t) for spec in components],axis=1)
     trends=np.stack([trend(r,t,Tstar) for r in streams(tr,N)],axis=1)
     gp=2*np.tanh(gp_fields(gr,N,Wwarm,Tstar,t))

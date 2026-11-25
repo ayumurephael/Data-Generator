@@ -5,7 +5,7 @@ import tarfile
 
 import numpy as np
 
-from .episodes import realize
+from .episodes import realize,require_frozen_seasons
 from .planning import Episode
 from .storage import atomic, pack, unpack
 
@@ -15,6 +15,7 @@ def replay(root,shard,uid,save=None):
     tag = Path(shard).name
     with tarfile.open(root/"private"/tag,"r:") as tar:
         meta = json.load(tar.extractfile(uid+".replay.json"))
+    require_frozen_seasons(meta,meta["retry"])
     ep = Episode(meta["split"],meta["N"],meta["family"],meta["ancestor"],meta["episode"],meta["K"],
                  meta["mode"],tuple(meta["focal"]) if meta["focal"] else None,meta["smoke"])
     if ep.id != uid:

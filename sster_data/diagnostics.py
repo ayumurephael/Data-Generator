@@ -7,6 +7,7 @@ import tarfile
 import numpy as np
 
 from . import catalog
+from .episodes import require_frozen_seasons
 from .planning import Episode
 from .scm import FAMILIES, rng_for, solve, world
 from .storage import read_json, unpack, write_json
@@ -120,10 +121,11 @@ def envelope(blocks,seed,replicates=1000):
 
 
 def metadata_kinds(ep,retry):
-    sr,_,_,tr,nr = catalog.streams(ep.rng("background",retry),5)
+    _,_,_,tr,nr = catalog.streams(ep.rng("background",retry),5)
     wld = world(ep.split,ep.n,ep.family,ep.ancestor)
     _,length,_ = ep.clock(wld.lag)
-    season = [catalog.season_params(r,length)["kind"] for r in catalog.streams(sr,ep.n)]
+    season = [component["kind"] for component in
+              catalog.normal_seasons(ep.rng("background"),ep.n,wld.warm,length).components]
     trend = [r.choice(TRENDS,p=[.2,.2,.2,.3,.1]) for r in catalog.streams(tr,ep.n)]
     noise = []
     for r in catalog.streams(nr,ep.n):
@@ -147,6 +149,7 @@ def released_backgrounds(root):
                     continue
                 uid = member.split(".")[0]
                 meta = json.load(archive.extractfile(uid+".replay.json"))
+                require_frozen_seasons(meta,meta["retry"])
                 ep = Episode(meta["split"],meta["N"],meta["family"],meta["ancestor"],meta["episode"],meta["K"],
                              meta["mode"],meta["focal"],meta["smoke"])
                 key = (ep.n,ep.family,ep.ancestor)
