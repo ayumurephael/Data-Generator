@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sster-data"
+version = "1.0.0"
+description = "Direct-state synthetic multivariate time series with paired anomaly and multi-root labels"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10", "PyWavelets==1.8.0"]
+
+[project.optional-dependencies]
+production = ["numba>=0.60", "torch>=2.2"]
+test = ["pytest>=7", "jsonschema>=4"]
+
+[project.scripts]
+sster-data = "sster_data.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sster_data*"]
+
+[tool.setuptools.package-data]
+sster_data = ["config/*.json"]

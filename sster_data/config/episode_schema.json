@@ -1,0 +1,518 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:autoresearch:sster-direct-state:20261125:episode-index",
+  "title": "SSTER direct-state synthetic episode sidecar",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "sample_id",
+    "ancestor",
+    "dimensions",
+    "arrays",
+    "events",
+    "policy_ref",
+    "calibration_ref",
+    "private_replay",
+    "audit"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": "sster-direct-state-20261125-v1"
+    },
+    "sample_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "ancestor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family_id",
+        "family_seed",
+        "split"
+      ],
+      "properties": {
+        "family_id": {
+          "type": "string"
+        },
+        "family_seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "split": {
+          "enum": [
+            "train",
+            "validation",
+            "test"
+          ]
+        }
+      }
+    },
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "T",
+        "N",
+        "V",
+        "L",
+        "dt",
+        "T_grid",
+        "crop_start",
+        "w"
+      ],
+      "properties": {
+        "T": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "N": {
+          "enum": [
+            1,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128
+          ]
+        },
+        "V": {
+          "enum": [
+            1,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128
+          ]
+        },
+        "L": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "dt": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "T_grid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "crop_start": {
+          "type": "integer",
+          "minimum": 64
+        },
+        "w": {
+          "enum": [
+            256,
+            512,
+            1024,
+            2048
+          ]
+        }
+      }
+    },
+    "arrays": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputs",
+        "targets"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "values",
+            "observed",
+            "time",
+            "channel_valid"
+          ],
+          "properties": {
+            "values": {
+              "$ref": "#/$defs/array"
+            },
+            "observed": {
+              "$ref": "#/$defs/array"
+            },
+            "time": {
+              "$ref": "#/$defs/array"
+            },
+            "channel_valid": {
+              "$ref": "#/$defs/array"
+            }
+          }
+        },
+        "targets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "Y",
+            "Y_known",
+            "R",
+            "R_known",
+            "E"
+          ],
+          "properties": {
+            "Y": {
+              "$ref": "#/$defs/array"
+            },
+            "Y_known": {
+              "$ref": "#/$defs/array"
+            },
+            "R": {
+              "$ref": "#/$defs/array"
+            },
+            "R_known": {
+              "$ref": "#/$defs/array"
+            },
+            "E": {
+              "$ref": "#/$defs/array"
+            }
+          }
+        }
+      }
+    },
+    "events": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "$ref": "#/$defs/event"
+      }
+    },
+    "policy_ref": {
+      "type": "string"
+    },
+    "calibration_ref": {
+      "type": "string"
+    },
+    "private_replay": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "right_censored",
+        "outside_candidate_cause",
+        "annotation_unknown",
+        "source_groups",
+        "root_sensor_count",
+        "input_allowlist",
+        "mode"
+      ],
+      "properties": {
+        "right_censored": {
+          "type": "boolean"
+        },
+        "outside_candidate_cause": {
+          "const": false
+        },
+        "annotation_unknown": {
+          "const": false
+        },
+        "source_groups": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "root_sensor_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "input_allowlist": {
+          "const": [
+            "values",
+            "observed",
+            "time",
+            "channel_valid"
+          ]
+        },
+        "mode": {
+          "enum": [
+            "healthy",
+            "process",
+            "observation",
+            "mixed"
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "array": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "entry",
+        "key",
+        "dtype",
+        "shape"
+      ],
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "entry": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "dtype": {
+          "enum": [
+            "bool",
+            "float32",
+            "float64"
+          ]
+        },
+        "shape": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "event_id",
+        "layer",
+        "target",
+        "sensor",
+        "kind",
+        "start",
+        "stop",
+        "amplitude",
+        "severity",
+        "params"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "layer": {
+          "enum": [
+            "process",
+            "observation"
+          ]
+        },
+        "target": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "physical node before the export permutation"
+        },
+        "kind": {
+          "enum": [
+            "L01",
+            "L02",
+            "L03",
+            "L04",
+            "L05",
+            "L06",
+            "L07",
+            "L08",
+            "L09",
+            "L10",
+            "L11",
+            "L12",
+            "L13",
+            "L14",
+            "L15",
+            "L16",
+            "L17",
+            "L18",
+            "L19",
+            "L20",
+            "S01",
+            "S02",
+            "S03",
+            "S04",
+            "S05",
+            "S06",
+            "S07",
+            "S08",
+            "S09",
+            "S10",
+            "S11",
+            "S12",
+            "S13",
+            "S14",
+            "S15",
+            "S16",
+            "S17",
+            "S18",
+            "S19",
+            "S20"
+          ]
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stop": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "amplitude": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sensor": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "exported sensor slot after the permutation"
+        },
+        "event_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "severity": {
+          "enum": [
+            "weak",
+            "medium",
+            "strong",
+            null
+          ]
+        },
+        "params": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "layer": {
+                "const": "observation"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "L01",
+                  "L02",
+                  "L03",
+                  "L04",
+                  "L05",
+                  "L06",
+                  "L07",
+                  "L08",
+                  "L09",
+                  "L10",
+                  "L11",
+                  "L12",
+                  "L13",
+                  "L14",
+                  "L15",
+                  "L16",
+                  "L17",
+                  "L18",
+                  "L19",
+                  "L20"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "x-contract": {
+    "array_shapes": {
+      "values": [
+        "T",
+        "N"
+      ],
+      "observed": [
+        "T",
+        "N"
+      ],
+      "time": [
+        "T"
+      ],
+      "channel_valid": [
+        "N"
+      ],
+      "Y": [
+        "T"
+      ],
+      "Y_known": [
+        "T"
+      ],
+      "R": [
+        "N"
+      ],
+      "R_known": [
+        "N"
+      ],
+      "E": [
+        "N"
+      ]
+    },
+    "semantic_checks_beyond_JSON_schema": [
+      "V=N",
+      "start>=64 and start<stop<=T_grid",
+      "crop_start+w<=T_grid",
+      "T equals the number of retained timestamps in the physical crop",
+      "one or two nonoverlapping events per source and at most six distinct physical sources",
+      "all first intervals inside the canonical crop",
+      "source maps to exactly one layer, physical target and exported sensor",
+      "distinct sources map to distinct physical sites across both layers",
+      "group count and mode agree with event ledger",
+      "E equals channel_valid for this fully measured synthetic profile",
+      "R_known implies E; R derives from direct physical intervals before thinning",
+      "arrays match shapes and required dtypes; missing inputs zero; valid times strictly increasing",
+      "factual and normal share ancestor, exogenous draws, masks, time and sensor permutation",
+      "input keys equal four-field allowlist"
+    ],
+    "private_arrays_required": [
+      "world_mechanisms_or_seed",
+      "background_params_or_seed",
+      "innovations_or_seed",
+      "initial_history_or_seed",
+      "physical_to_exported",
+      "acquisition_or_seed",
+      "calibration_ref",
+      "event_ledger_and_noise_or_seed",
+      "guard_status"
+    ],
+    "private_arrays_optional_when_used": [
+      "complete_normal_and_factual_trajectories",
+      "delta_U_trace",
+      "normal_season_parameters_and_transformed_parameters",
+      "source_visibility_counts"
+    ]
+  }
+}

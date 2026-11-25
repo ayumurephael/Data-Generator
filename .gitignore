@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.nb[ci]
+*.egg-info/
+.pytest_cache/
+.venv/
+corpus/
