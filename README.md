@@ -23,6 +23,12 @@ python -m sster_data verify --out /tmp/sster-smoke --split all --deep
 python -m pytest
 ~~~
 
+To vary the worker count per GPU, specify indices local to the process after `CUDA_VISIBLE_DEVICES` filtering. Each split starts at the first index and cycles through the list as its workers start. Repeated indices assign multiple workers to that GPU. This example assigns one worker each to local GPUs 0–3 and two each to 4–5. The option selects CUDA for those workers and takes precedence over `SSTER_GP_DEVICE`. Separate split commands can use different device lists.
+
+~~~bash
+python -m sster_data generate --out /data/sster --split train --workers 8 --worker-devices 0,1,2,3,4,4,5,5
+~~~
+
 ## Corpus and random access
 
 Each split has a manifest, an audit report and a completion marker named `_SUCCESS`. Each manifest row gives a relative tar path and byte offset/size pairs `input_offset,input_size` and `target_offset,target_size`. Seek to each offset, read the indicated byte count and load those bytes with NumPy and `allow_pickle=False`. These offsets refer to member data in an uncompressed tar. Arrays within each member use ZIP compression. Each unpadded example has its own length and width.

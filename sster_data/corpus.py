@@ -334,9 +334,34 @@ def deep_check(root):
             handle.close()
 
 
-def configure_worker():
+class WorkerDeviceError(ValueError):
+    """An explicit GP worker device map cannot run on this host."""
+
+
+def validate_worker_devices(devices):
+    if not devices or any(type(index) is not int or index < 0 for index in devices):
+        raise WorkerDeviceError("--worker-devices requires one or more nonnegative CUDA indices")
+    try:
+        import torch
+    except ImportError as exc:
+        raise WorkerDeviceError("--worker-devices requires PyTorch with CUDA support") from exc
+    if not torch.cuda.is_available():
+        raise WorkerDeviceError("--worker-devices requires CUDA; no CUDA device is available")
+    count = torch.cuda.device_count()
+    if max(devices) >= count:
+        raise WorkerDeviceError(f"--worker-devices index {max(devices)} is outside the {count} visible CUDA devices")
+
+
+def configure_worker(worker_devices=None, next_slot=None):
     os.environ["OMP_NUM_THREADS"] = os.environ["OPENBLAS_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = "1"
-    if os.environ.get("SSTER_GP_DEVICE","cpu").startswith("cuda"):
+    if worker_devices is not None:
+        import torch
+        with next_slot.get_lock():
+            index = worker_devices[next_slot.value % len(worker_devices)]
+            next_slot.value += 1
+        torch.cuda.set_device(index)
+        os.environ["SSTER_GP_DEVICE"] = f"cuda:{index}"
+    elif os.environ.get("SSTER_GP_DEVICE","cpu").startswith("cuda"):
         import torch
         devices = torch.cuda.device_count()
         if not devices:
@@ -345,7 +370,10 @@ def configure_worker():
         torch.cuda.set_device(rank % devices)
 
 
-def generate(out, split, workers, smoke=False):
+def generate(out, split, workers, smoke=False, worker_devices=None):
+    if worker_devices is not None:
+        worker_devices = tuple(worker_devices)
+        validate_worker_devices(worker_devices)
     out = Path(out)
     out.mkdir(exist_ok=True,parents=True)
     root = out/split
@@ -363,7 +391,10 @@ def generate(out, split, workers, smoke=False):
             print(f"{split} already published {doc['windows']} windows",flush=True)
             return
         os.environ["OMP_NUM_THREADS"] = os.environ["OPENBLAS_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = "1"
-        with multiprocessing.get_context("spawn").Pool(workers,initializer=configure_worker) as pool:
+        ctx = multiprocessing.get_context("spawn")
+        # A fresh counter per pool makes sequential and separately launched splits start at slot zero.
+        initargs = () if worker_devices is None else (worker_devices,ctx.Value("q",0))
+        with ctx.Pool(workers,initializer=configure_worker,initargs=initargs) as pool:
             print(f"{split}: fitting/checking independent scale bank",flush=True)
             bank = calibration(out,smoke,pool)
             for n in widths(smoke):

@@ -2,9 +2,16 @@ import argparse
 import json
 from pathlib import Path
 
-from .corpus import finalize, generate
+from .corpus import WorkerDeviceError, finalize, generate
 from .storage import lock, read_json
 from .replay import replay
+
+
+def parse_devices(text):
+    fields = [field.strip() for field in text.split(",")]
+    if any(not field.isascii() or not field.isdecimal() for field in fields):
+        raise argparse.ArgumentTypeError("expected comma-separated nonnegative local CUDA indices (e.g. 0,1,1)")
+    return tuple(map(int,fields))
 
 
 def main():
@@ -29,6 +36,8 @@ def main():
         p.add_argument("--split",choices=["train","validation","test","all"],default="train")
     for p in (build,smoke):
         p.add_argument("--workers",type=int,default=1)
+        p.add_argument("--worker-devices",type=parse_devices,metavar="I,J,...",
+                       help="Assign GP workers cyclically to local CUDA indices; repeat an index for more workers.")
     check.add_argument("--deep",action="store_true",help="Also decode every indexed public member using random-access offsets.")
     args = parser.parse_args()
     if args.cmd == "diagnose":
@@ -50,7 +59,10 @@ def main():
                 report = finalize(root,split,marker["smoke"],deep=args.deep)
                 print(f"{split}: {report['windows']} windows, manifest SHA-256 {report['manifest_sha256']}")
         else:
-            generate(args.out,split,args.workers,smoke=args.cmd=="smoke")
+            try:
+                generate(args.out,split,args.workers,smoke=args.cmd=="smoke",worker_devices=args.worker_devices)
+            except WorkerDeviceError as exc:
+                parser.error(str(exc))
 
 
 if __name__ == "__main__":
