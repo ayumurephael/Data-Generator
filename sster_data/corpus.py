@@ -1,6 +1,7 @@
 """Resumable, deterministic width-at-a-time corpus builder."""
-from collections import Counter, defaultdict
-from functools import lru_cache
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache, partial
 import hashlib
 import itertools
 import json
@@ -12,6 +13,7 @@ import tarfile
 import numpy as np
 
 from .ancestry import check_plan, resolve, sidecar as ancestry_sidecar
+from . import round1
 from .balance import balanced_orders
 from .calibration import calibration
 from .episodes import NumericalFailure, realize, require_frozen_seasons
@@ -23,6 +25,7 @@ BATCH = 64
 INPUTS = ("values","observed","time","channel_valid")
 TARGETS = ("Y","Y_known","R","R_known","E")
 SHARD_LIMIT = 256*1024**2
+FINALIZE_READERS = 4
 
 
 @lru_cache(maxsize=8)
@@ -40,6 +43,26 @@ def read_member(tar, name):
     if member is None:
         raise IOError(f"missing archive member {name}")
     return member.read()
+
+
+def write_native_episode(archive, ep, scale, audit):
+    failures = []
+    for retry in range(50):
+        try:
+            inp,tgt,meta,traces = realize(ep,scale,retry,audit=audit)
+            break
+        except (NumericalFailure, np.linalg.LinAlgError) as err:
+            failures.append(str(err))
+    else:
+        raise RuntimeError(f"numerical rejection exhausted for {ep.id}: {failures}")
+    meta.update(rejections=failures,profile=PROFILE,smoke=ep.smoke)
+    archive.add(ep.id+".npz",pack({**inp, **tgt}))
+    archive.add(ep.id+".json",encode(meta))
+    if traces is not None:
+        archive.add(ep.id+".trace.npz",pack(traces))
+    known = np.flatnonzero(tgt["R"] & tgt["R_known"]).tolist()
+    roots = np.flatnonzero(tgt["R"]).tolist()
+    return [ep.id,roots,known]
 
 
 def stage(job):
@@ -75,23 +98,7 @@ def stage(job):
     with Archive(stage_path) as archive:
         for serial in range(begin,end):
             ep = Episode(split,n,*decode_record(*p[serial]),smoke=smoke)
-            failures = []
-            for retry in range(50):
-                try:
-                    inp,tgt,meta,traces = realize(ep,scales[ep.family],retry,audit=(serial%8192==0))
-                    break
-                except (NumericalFailure, np.linalg.LinAlgError) as err:
-                    failures.append(str(err))
-            else:
-                raise RuntimeError(f"numerical rejection exhausted for {ep.id}: {failures}")
-            meta.update(rejections=failures,profile=PROFILE,smoke=smoke)
-            archive.add(ep.id+".npz",pack({**inp, **tgt}))
-            archive.add(ep.id+".json",encode(meta))
-            if traces is not None:
-                archive.add(ep.id+".trace.npz",pack(traces))
-            known = np.flatnonzero(tgt["R"] & tgt["R_known"]).tolist()
-            roots = np.flatnonzero(tgt["R"]).tolist()
-            roles.append([ep.id,roots,known])
+            roles.append(write_native_episode(archive, ep, scales[ep.family], serial%8192==0))
     write_json(roles_path,dict(sha256=digest(stage_path),roles=roles))
 
 
@@ -223,14 +230,40 @@ def prepare_orders(root,n,p,starts):
     os.replace(tmp,path)
 
 
+def _verified_receipt(root, n, begin):
+    receipt = read_json(paths(root,n,begin)[-1])
+    for kind in ("public","private"):
+        name = receipt[kind]
+        if digest(root/name) != receipt[kind+"_sha256"]:
+            raise IOError(f"archive hash mismatch {name}")
+    return begin,receipt
+
+
+def _ordered_receipts(root, n, starts, readers):
+    # Bound decoded receipts and open archives independently of the split size.
+    # Only the consumer folds verified hashes, rows, and exceptions into plan order.
+    pending = deque()
+    for begin in starts:
+        pending.append(readers.submit(_verified_receipt,root,n,begin))
+        if len(pending) == FINALIZE_READERS:
+            yield pending.popleft().result()
+    while pending:
+        yield pending.popleft().result()
+
+
 def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
+    first_round = round1.is_first_round(root)
+    if first_round and (smoke or split != "train"):
+        raise ValueError("first-round quotas apply only to production training")
     existing = None
     if (root/"_SUCCESS").exists():
         marker = read_json(root/"_SUCCESS")
+        if marker.get("training_edition") != (round1.EDITION if first_round else None):
+            raise ValueError("published marker disagrees with the training edition")
         if marker["audit_sha256"] != digest(root/"audit.json") or marker["manifest_sha256"] != digest(root/"manifest.jsonl"):
             raise IOError("published marker does not match audit or manifest")
         existing = read_json(root/"audit.json")
-    expected = quotas(split,smoke)
+    expected = round1.quotas() if first_round else quotas(split,smoke)
     counts, focuses, witnessed, appearance = Counter(),Counter(),Counter(),Counter()
     all_events, seen_events = Counter(),Counter()
     quality,layouts,acquisitions,repeated,severity = Counter(),Counter(),Counter(),Counter(),Counter()
@@ -239,25 +272,23 @@ def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
     # Retain only 16 binary bytes per record for the cross-width ID audit.
     uid_table = np.empty(sum(expected.values()),dtype="V16")
     ancestor_count,episode_count,_ = dimensions(split,smoke)
+    if first_round:
+        episode_count = round1.PER_ANCESTOR
     tmp = root/"manifest.partial"
     total = 0
     shard_hash = hashlib.sha256()
     repairs = {}
-    with open(tmp,"wb") as out:
+    with open(tmp,"wb") as out, ThreadPoolExecutor(max_workers=FINALIZE_READERS) as readers:
         for n in widths(smoke):
             path = root/"build"/f"plan-{n}.npy"
             roster = resolve(split,n,FAMILIES,ancestor_count,pool) if roster_by_width is None else roster_by_width[n]
-            p = check_plan(path,split,n,smoke,roster)
+            p = round1.verify(path,n,roster) if first_round else check_plan(path,split,n,smoke,roster)
             if any(r.replaced for r in roster.values()):
                 repairs[str(n)] = digest(ancestry_sidecar(path))
-            for begin in range(0,len(p),BATCH):
-                receipt = read_json(paths(root,n,begin)[-1])
+            starts = range(0,len(p),BATCH)
+            for begin,receipt in _ordered_receipts(root,n,starts,readers):
                 for kind in ("public","private"):
-                    name = receipt[kind]
-                    check = digest(root/name)
-                    if check != receipt[kind+"_sha256"]:
-                        raise IOError(f"archive hash mismatch {name}")
-                    shard_hash.update(encode([name,check]))
+                    shard_hash.update(encode([receipt[kind],receipt[kind+"_sha256"]]))
                 if len(receipt["rows"]) != min(BATCH,len(p)-begin):
                     raise ValueError("short shard")
                 for j,row in enumerate(receipt["rows"],begin):
@@ -265,7 +296,8 @@ def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
                     ep = Episode(split,n,*decode_record(*p[j]),smoke=smoke)
                     family = FAMILIES[j//(ancestor_count*episode_count)]
                     candidate = roster[family].ids[j//episode_count%ancestor_count]
-                    if (ep.family,ep.ancestor,ep.episode) != (family,candidate,j%episode_count):
+                    if ((ep.family,ep.ancestor) != (family,candidate)
+                            or (not first_round and ep.episode != j%episode_count)):
                         raise ValueError("ancestor/episode multiplicity or split membership failed")
                     if row["id"] != ep.id or (row["K"],row["mode"],row["ancestor"],row["episode"],row["family"],row["focal"]) != (
                             ep.k,ep.mode,ep.ancestor,ep.episode,ep.family,list(ep.focus) if ep.focus else None):
@@ -303,7 +335,7 @@ def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
     uid_table.sort()
     if np.any(uid_table[1:] == uid_table[:-1]):
         raise ValueError("duplicate opaque identifier")
-    reps = dimensions(split,smoke)[2]
+    reps = round1.FOCAL if first_round else dimensions(split,smoke)[2]
     risk = []
     for (n,k,mode),cnt in expected.items():
         if not k:
@@ -312,10 +344,10 @@ def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
             key = n,k,mode,layer,code
             if focuses[key] != reps:
                 raise ValueError(f"focal coverage failed {key}: {focuses[key]}/{reps}")
-            if reps == 96 and (code.startswith("L") or code == "S04"):
-                if any(appearance[key+(s,)] != 32 for s in range(3)):
+            if reps in (48,96) and (code.startswith("L") or code == "S04"):
+                if any(appearance[key+(s,)] != reps//3 for s in range(3)):
                     raise ValueError(f"imbalanced focal severity {key}")
-            if reps == 96 and witnessed[key] < 12:
+            if reps in (48,96) and witnessed[key] < 12:
                 risk.append([*key,witnessed[key]])
     def records(counter):
         return [[*key,value] for key,value in sorted(counter.items())]
@@ -330,6 +362,13 @@ def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
         report["numerical_retry_seasons"] = "initial-background"
     if repairs:
         report["ancestor_replacement_sha256"] = repairs
+    edition_fields = {}
+    if first_round:
+        if any(np.ptp(a[0]) for a in exp.values()):
+            raise ArithmeticError("first-round raw exposure is not exactly equal across slots")
+        edition_fields["training_edition"] = round1.EDITION
+        report.update(edition_fields)
+        report["selection_sha256"] = {n:digest(root/"build"/f"round1-{n}.json") for n in widths(False)}
     if existing is not None and repairs != existing.get("ancestor_replacement_sha256",{}):
         raise ValueError("published ancestor replacement binding differs from verified plans")
     report["manifest_sha256"] = digest(tmp)
@@ -340,7 +379,7 @@ def finalize(root, split, smoke, deep=False, roster_by_width=None, pool=None):
         deep_check(root)
     write_json(root/"audit.json",report)
     write_json(root/"_SUCCESS",dict(profile=PROFILE,windows=total,manifest_sha256=report["manifest_sha256"],
-                                   audit_sha256=digest(root/"audit.json"),smoke=smoke))
+                                   audit_sha256=digest(root/"audit.json"),smoke=smoke,**edition_fields))
     return report
 
 
@@ -402,24 +441,36 @@ def configure_worker(worker_devices=None, next_slot=None):
         torch.cuda.set_device(rank % devices)
 
 
-def generate(out, split, workers, smoke=False, worker_devices=None):
+def generate(out, split, workers, smoke=False, worker_devices=None, training_edition=None,
+             parent_source=None, extra_builds=()):
+    if training_edition not in (None, round1.EDITION) or (training_edition and (split != "train" or smoke)):
+        raise ValueError("unknown edition or incompatible split")
+    if parent_source is not None and not training_edition:
+        raise ValueError("parent archives are only used for first-round training")
     if worker_devices is not None:
         worker_devices = tuple(worker_devices)
         validate_worker_devices(worker_devices)
     out = Path(out)
     out.mkdir(exist_ok=True,parents=True)
     root = out/split
+    if parent_source is not None and Path(parent_source).resolve() == out.resolve():
+        raise ValueError("first-round release requires an independent output directory")
     for sub in ("build","receipts","shards","private"):
         (root/sub).mkdir(parents=True,exist_ok=True)
     with lock(root/"build.lock"):
+        round1.bind(root, training_edition)
         ctx = multiprocessing.get_context("spawn")
         ancestor_count = dimensions(split,smoke)[0]
         success = root/"_SUCCESS"
         if success.exists():
             doc = read_json(success)
+            if doc.get("training_edition") != training_edition:
+                raise ValueError("existing release uses a different training edition")
             if doc["smoke"] != smoke or doc["manifest_sha256"] != digest(root/"manifest.jsonl") or doc["audit_sha256"] != digest(root/"audit.json"):
                 raise IOError("existing release does not match requested profile or checksums")
             previous = read_json(root/"audit.json")
+            if previous.get("training_edition") != training_edition:
+                raise ValueError("published audit disagrees with the training edition")
             if previous["numerical_rejections"] and previous.get("numerical_retry_seasons") != "initial-background":
                 raise ValueError("existing release contains legacy numerical retries; audit and rebuild affected shards")
             repairs = {}
@@ -427,7 +478,12 @@ def generate(out, split, workers, smoke=False, worker_devices=None):
                 for n in widths(smoke):
                     path = root/"build"/f"plan-{n}.npy"
                     roster = resolve(split,n,FAMILIES,ancestor_count,validation_pool)
-                    check_plan(path,split,n,smoke,roster)
+                    if training_edition:
+                        round1.verify(path,n,roster)
+                        if previous.get("selection_sha256",{}).get(str(n)) != digest(path.parent/f"round1-{n}.json"):
+                            raise ValueError("published ticket selection does not match the verified plans")
+                    else:
+                        check_plan(path,split,n,smoke,roster)
                     if any(r.replaced for r in roster.values()):
                         repairs[str(n)] = digest(ancestry_sidecar(path))
             if repairs != previous.get("ancestor_replacement_sha256",{}):
@@ -439,17 +495,26 @@ def generate(out, split, workers, smoke=False, worker_devices=None):
         initargs = () if worker_devices is None else (worker_devices,ctx.Value("q",0))
         with ctx.Pool(workers,initializer=configure_worker,initargs=initargs) as pool:
             print(f"{split}: fitting/checking independent scale bank",flush=True)
+            if parent_source is not None:
+                round1.reuse_calibration(out, parent_source)
             bank = calibration(out,smoke,pool)
+            stage_worker = stage
+            if parent_source is not None:
+                from . import reuse
+                if digest(out/"calibration.json") != digest(Path(parent_source)/"calibration.json"):
+                    raise ValueError("cannot reuse examples with different calibration")
+                stage_worker = partial(reuse.stage,source_root=Path(parent_source)/"train",extra_builds=extra_builds)
             roster_by_width = {}
             for n in widths(smoke):
                 _,p_path,*_ = paths(root,n,0)
                 print(f"{split} N={n}: matching frozen backgrounds and template quotas",flush=True)
                 roster = resolve(split,n,FAMILIES,ancestor_count,pool)
                 roster_by_width[n] = roster
-                p = plan(p_path,split,n,smoke,roster)
+                p = (round1.prepare(p_path,n,roster,parent_source) if training_edition else
+                     plan(p_path,split,n,smoke,roster))
                 starts = range(0,len(p),BATCH)
                 jobs = ((root,split,smoke,n,b,min(b+BATCH,len(p)),bank["scales"]) for b in starts)
-                for i,_ in enumerate(pool.imap_unordered(stage,jobs,chunksize=1),1):
+                for i,_ in enumerate(pool.imap_unordered(stage_worker,jobs,chunksize=1),1):
                     if i == 1 or i%128 == 0 or i == len(starts):
                         print(f"{split} N={n}: physical chunks {i}/{len(starts)}",flush=True)
                 print(f"{split} N={n}: assigning export channels",flush=True)

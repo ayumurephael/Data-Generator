@@ -5,6 +5,7 @@ import multiprocessing
 from pathlib import Path
 
 from .corpus import WorkerDeviceError, finalize, generate
+from .round1 import EDITION
 from .storage import lock, read_json
 from .replay import replay
 
@@ -20,6 +21,10 @@ def main():
     parser = argparse.ArgumentParser(description="Build the SSTER direct-state synthetic corpus.")
     sub = parser.add_subparsers(dest="cmd",required=True)
     build = sub.add_parser("generate",help="Generate or resume a complete production split.")
+    build.add_argument("--training-edition",choices=[EDITION],help="Use the 1.68M-window first-round train schedule.")
+    build.add_argument("--parent-source",type=Path,help="Reuse verified full-schedule training archives or render missing tickets.")
+    build.add_argument("--extra-build",type=Path,action="append",default=[],
+                       help="Additional parent physical staging directory. Requires --parent-source.")
     smoke = sub.add_parser("smoke",help="Generate a small integration fixture in its own output directory.")
     check = sub.add_parser("verify",help="Rehash every shard and re-audit published labels and quotas.")
     sample = sub.add_parser("replay",help="Reproduce a stored example and compare all arrays.")
@@ -43,6 +48,11 @@ def main():
     check.add_argument("--deep",action="store_true",help="Also decode every indexed public member using random-access offsets.")
     check.add_argument("--workers",type=int,default=1,help="CPU processes for deterministic structural ancestor checks.")
     args = parser.parse_args()
+    if args.cmd == "generate":
+        if (args.parent_source and not args.training_edition) or (args.extra_build and not args.parent_source):
+            parser.error("parent sources require a first-round training edition; extra builds require a parent source")
+        if args.training_edition and args.split not in ("train","all"):
+            parser.error("the training edition applies to train only")
     if args.cmd == "diagnose":
         from .diagnostics import diagnose
         if args.repetitions < 1 or args.length <= 256:
@@ -64,7 +74,10 @@ def main():
                 print(f"{split}: {report['windows']} windows, manifest SHA-256 {report['manifest_sha256']}")
         else:
             try:
-                generate(args.out,split,args.workers,smoke=args.cmd=="smoke",worker_devices=args.worker_devices)
+                first = args.cmd == "generate" and split == "train" and args.training_edition
+                generate(args.out,split,args.workers,smoke=args.cmd=="smoke",worker_devices=args.worker_devices,
+                         training_edition=first or None,parent_source=args.parent_source if first else None,
+                         extra_builds=args.extra_build if first else ())
             except WorkerDeviceError as exc:
                 parser.error(str(exc))
 

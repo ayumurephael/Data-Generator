@@ -154,34 +154,77 @@ def trend(rng,t,duration):
     return (1-weight)*det+weight*(np.cumsum(st) if integrated else st)
 
 
-def kernel_cov(rng,knots,duration):
-    dist=np.abs(knots[:,None]-knots)
-    u=np.clip(knots/(duration-1),0,1)
-    cov=None
-    for _ in range(rng.integers(1,5)):
-        i=rng.integers(7)
-        ell=logu(rng,2,duration/2)
-        if i==0: k=np.exp(-.5*(dist/ell)**2)
-        elif i==1: k=np.exp(-2*(np.sin(np.pi*dist/logu(rng,2,duration/2))/ell)**2)
-        elif i==2:
-            alpha=rng.uniform(.25,4)
-            k=(1+(dist/ell)**2/(2*alpha))**(-alpha)
-        elif i==3:
-            x=np.sqrt(3)*dist/ell
-            k=(1+x)*np.exp(-x)
-        elif i==4: k=np.ones_like(dist)
-        elif i==5: k=np.eye(len(knots))
-        else: k=1+np.outer(u,u)
-        k/=max(np.diag(k).max(),1e-12)
-        if cov is None: cov=k
-        else: cov=cov+k if rng.integers(2) else cov*k
-        cov/=max(np.diag(cov).max(),1e-12)
-    return (cov+cov.T)*.5
+class _KernelGrid:
+    """Share exact knot distances across all covariance draws for one grid."""
+
+    def __init__(self, knots, duration):
+        self.duration = duration
+        self.knots = knots
+        distances = np.abs(knots[:, None] - knots)
+        self.lags, inverse = np.unique(distances, return_inverse=True)
+        self.lag_index = inverse.reshape(distances.shape)
+        unit_time = np.clip(knots / (duration - 1), 0, 1)
+        self.linear = 1 + np.outer(unit_time, unit_time)
+        self.linear /= max(self.linear.diagonal().max(), 1e-12)
+        # White noise is independent at distinct sample indices even if knots repeat.
+        self.white = ((self.lags == 0).astype(np.float64)
+                      if len(np.unique(knots)) == len(knots) else np.eye(len(knots)))
+
+    def dense(self, values):
+        return values[self.lag_index] if values.ndim == 1 else values
+
+    def draw_component(self, rng):
+        kind = rng.integers(7)
+        scale = logu(rng, 2, self.duration / 2)
+        lag = self.lags
+        if kind == 0:
+            return np.exp(-.5 * (lag / scale)**2)
+        if kind == 1:
+            period = logu(rng, 2, self.duration / 2)
+            return np.exp(-2 * (np.sin(np.pi * lag / period) / scale)**2)
+        if kind == 2:
+            alpha = rng.uniform(.25, 4)
+            return (1 + (lag / scale)**2 / (2 * alpha))**(-alpha)
+        if kind == 3:
+            x = np.sqrt(3) * lag / scale
+            return (1 + x) * np.exp(-x)
+        if kind == 4:
+            return np.ones_like(lag)
+        if kind == 5:
+            return self.white
+        return self.linear
+
+    def covariance(self, rng):
+        components = rng.integers(1, 5)
+        cov = self.draw_component(rng)
+        for _ in range(1, components):
+            part = self.draw_component(rng)
+            if cov.ndim != part.ndim:
+                cov, part = self.dense(cov), self.dense(part)
+            cov = cov + part if rng.integers(2) else cov * part
+            # A stationary kernel has a constant diagonal at exact lag zero.
+            diagonal_max = cov[0] if cov.ndim == 1 else cov.diagonal().max()
+            cov /= max(diagonal_max, 1e-12)
+        result = self.dense(cov)
+        return (result + result.T) * .5
+
+
+def kernel_cov(rng, knots, duration):
+    return _KernelGrid(knots, duration).covariance(rng)
+
+
+@lru_cache(maxsize=8)
+def _gp_grid(warm, duration):
+    knots = np.linspace(-warm, duration - 1, min(256, duration + warm))
+    return _KernelGrid(knots, duration)
 
 
 def gp_fields(rng,count,warm,duration,t):
-    knots=np.linspace(-warm,duration-1,min(256,duration+warm))
-    matrices=np.stack([kernel_cov(r,knots,duration) for r in streams(rng,count)])
+    grid = _gp_grid(warm, duration)
+    knots = grid.knots
+    matrices = np.empty((count, len(knots), len(knots)), dtype=np.float64)
+    for i, component_rng in enumerate(streams(rng, count)):
+        matrices[i] = grid.covariance(component_rng)
     normal=rng.standard_normal((count,len(knots),1))
     device=os.environ.get("SSTER_GP_DEVICE","cpu")
     if device.startswith("cuda"):

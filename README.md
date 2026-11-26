@@ -1,6 +1,6 @@
 # SSTER synthetic data generator
 
-This package implements the November 25 direct-state profile for jointly supervised anomaly detection and multi-root localization. Production generates 6,720,000 training windows and 336,000 windows in each held-out split. The published input contains direct observations, an acquisition mask, physical time and a valid-channel mask. Fault records, paired healthy states and proof bounds are private.
+This package implements the November 25 direct-state profile for jointly supervised anomaly detection and multi-root localization. The first-round training edition contains 1,680,000 windows. The full training schedule contains 6,720,000. Both use 336,000 windows in each held-out split. The published input contains direct observations, an acquisition mask, physical time and a valid-channel mask. Fault records, paired healthy states and proof bounds are private.
 
 ## Generate
 
@@ -14,6 +14,15 @@ python -m sster_data generate --out /data/sster --split all --workers 6
 python -m sster_data verify --out /data/sster --split all --deep
 python -m sster_data diagnose --out /data/sster --split train
 ~~~
+
+For first-round training use a separate output directory. Each of the seven widths receives 240,000 windows drawn from all 15,000 structural ancestors at that width, with exactly 16 episodes per ancestor. The selector reserves 48 examples of each applicable template within each fault-count and injection-mode cell. It retains the original episode identifiers, intervention schedule and labels. The release rebalances exported channel positions over the selected windows.
+
+~~~bash
+python -m sster_data generate --out /data/round1 --split train --workers 6 --training-edition round1-1680k-v1 --parent-source /data/sster
+python -m sster_data verify --out /data/round1 --split train --deep
+~~~
+
+The optional parent directory supplies its frozen training schedules and calibration, published archives and completed staging archives. Missing selected windows are generated from their tickets. Omit this option for an independent build from a seed. Reuse the original validation and test directories when comparing training editions. The training audit and completion marker identify the edition, and each width binds its selected rows to the original schedule with SHA-256.
 
 Omit the GPU setting for CPU GP evaluation. Workers are spawned, and CUDA GPs use the current worker's selected device. Repeat the generation command after an interruption. Use a separate output directory for the smoke corpus. This exercises every structural family, healthy and joint fault paths, and up to six roots, using 48 windows per split. Smoke data has a separate calibration bank and cannot complete a production release.
 
